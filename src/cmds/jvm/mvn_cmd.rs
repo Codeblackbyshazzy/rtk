@@ -168,6 +168,7 @@ pub fn filter_surefire(raw: &str) -> String {
     let mut block_running: Option<String> = None;
     let mut in_block = false;
     let mut failure_trail = false;
+    let mut keep_continuation = false;
 
     for line in stripped.lines() {
         if PLUGIN_BANNER.is_match(line) {
@@ -182,6 +183,7 @@ pub fn filter_surefire(raw: &str) -> String {
             block_running = Some(line.to_string());
             in_block = true;
             failure_trail = false;
+            keep_continuation = false;
             continue;
         }
 
@@ -219,9 +221,20 @@ pub fn filter_surefire(raw: &str) -> String {
             continue;
         }
 
+        if keep_continuation && (line.starts_with(' ') || line.starts_with('\t')) {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
         if keep_outside_block(line) {
             out.push_str(line);
             out.push('\n');
+            keep_continuation = line.starts_with("[ERROR]")
+                && !line.starts_with("[ERROR] Tests run:")
+                && !line.starts_with("[ERROR] Failures:")
+                && !line.starts_with("[ERROR] Errors:");
+            continue;
         }
     }
 
@@ -862,6 +875,49 @@ mod tests {
         assert!(
             !o.contains("at org.junit."),
             "framework frame stripped in trail; got:\n{}",
+            o
+        );
+    }
+
+    /// `mvn test` whose compile step fails before Surefire runs must still
+    /// keep the `[ERROR]` block's indented `symbol:` / `location:` continuation
+    /// lines. Regression guard for the P0 reviewer ask: `filter_surefire`
+    /// previously dropped them because it had no `keep_continuation` flag.
+    #[test]
+    fn surefire_keeps_compile_continuation_on_test_phase() {
+        let i = include_str!("../../../tests/fixtures/mvn_test_compile_fail_slice_raw.txt");
+        let o = filter_surefire(i);
+        assert!(o.contains("cannot find symbol"), "ERROR line preserved; got:\n{}", o);
+        assert!(
+            o.contains("symbol:   variable bar"),
+            "indented `symbol:` continuation preserved; got:\n{}",
+            o
+        );
+        assert!(
+            o.contains("location: class org.apache.commons.cli.CompileBreaker"),
+            "indented `location:` continuation preserved; got:\n{}",
+            o
+        );
+        assert!(o.contains("BUILD FAILURE"), "footer preserved; got:\n{}", o);
+    }
+
+    /// Regression guard on the package path so the install/verify route does
+    /// not silently drift the other way after the `filter_surefire` continuation
+    /// fix. Uses the existing compile-error slice — `filter_package` is the
+    /// `install`-phase entry point and must keep the same continuation lines.
+    #[test]
+    fn package_still_keeps_compile_error_continuation_after_refactor() {
+        let i = include_str!("../../../tests/fixtures/mvn_compile_error_slice_raw.txt");
+        let o = filter_package(i);
+        assert!(o.contains("cannot find symbol"), "ERROR line preserved; got:\n{}", o);
+        assert!(
+            o.contains("symbol:   variable bar"),
+            "indented `symbol:` continuation preserved; got:\n{}",
+            o
+        );
+        assert!(
+            o.contains("location: class org.apache.commons.cli.CompileBreaker"),
+            "indented `location:` continuation preserved; got:\n{}",
             o
         );
     }
