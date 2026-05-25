@@ -187,9 +187,9 @@ fn keep_outside_block(line: &str) -> bool {
 ///     emits **after** the close line, terminated by a blank line. Framework
 ///     frames (junit, jdk.proxy, java.base, etc.) are stripped from both the
 ///     buffered block and the trail; user-code frames are preserved.
-struct SurefireBlock {
-    block_lines: Vec<String>,
-    block_running: Option<String>,
+struct SurefireBlock<'a> {
+    block_lines: Vec<&'a str>,
+    block_running: Option<&'a str>,
     in_block: bool,
     failure_trail: bool,
     /// When set together with `failure_trail`, consumes the trail (per-test
@@ -198,22 +198,22 @@ struct SurefireBlock {
     drop_trail: bool,
 }
 
-enum SurefireStep {
+enum SurefireStep<'a> {
     /// Inner machine consumed the line; outer loop should `continue;`.
     Consumed,
     /// A CLOSE line with `Failures > 0` or `Errors > 0` was reached. Outer
     /// loop decides whether to commit (via [`SurefireBlock::commit_failing`]).
     FailingClose {
-        running: Option<String>,
-        lines: Vec<String>,
-        close: String,
+        running: Option<&'a str>,
+        lines: Vec<&'a str>,
+        close: &'a str,
     },
     /// Inner machine did not handle the line; outer loop applies its own
     /// outside-block keep logic.
     Passthrough,
 }
 
-impl SurefireBlock {
+impl<'a> SurefireBlock<'a> {
     fn new() -> Self {
         Self {
             block_lines: Vec::new(),
@@ -224,7 +224,7 @@ impl SurefireBlock {
         }
     }
 
-    fn step(&mut self, line: &str, out: &mut String) -> SurefireStep {
+    fn step(&mut self, line: &'a str, out: &mut String) -> SurefireStep<'a> {
         if PLUGIN_BANNER.is_match(line) {
             return SurefireStep::Consumed;
         }
@@ -234,7 +234,7 @@ impl SurefireBlock {
                 self.flush_open_block_as_keep(out);
             }
             self.block_lines.clear();
-            self.block_running = Some(line.to_string());
+            self.block_running = Some(line);
             self.in_block = true;
             self.failure_trail = false;
             return SurefireStep::Consumed;
@@ -251,7 +251,7 @@ impl SurefireBlock {
                     return SurefireStep::FailingClose {
                         running,
                         lines,
-                        close: line.to_string(),
+                        close: line,
                     };
                 }
                 self.block_lines.clear();
@@ -259,7 +259,7 @@ impl SurefireBlock {
                 self.in_block = false;
                 return SurefireStep::Consumed;
             }
-            self.block_lines.push(line.to_string());
+            self.block_lines.push(line);
             return SurefireStep::Consumed;
         }
 
@@ -303,7 +303,7 @@ impl SurefireBlock {
         &mut self,
         out: &mut String,
         running: Option<&str>,
-        lines: &[String],
+        lines: &[&str],
         close: &str,
     ) {
         if let Some(r) = running {
@@ -333,11 +333,11 @@ impl SurefireBlock {
 
     fn flush_open_block_as_keep(&mut self, out: &mut String) {
         if let Some(r) = self.block_running.take() {
-            out.push_str(&r);
+            out.push_str(r);
             out.push('\n');
         }
         for l in self.block_lines.drain(..) {
-            out.push_str(&l);
+            out.push_str(l);
             out.push('\n');
         }
         self.in_block = false;
@@ -465,7 +465,7 @@ fn filter_surefire_with_cap(raw: &str, cap: usize) -> String {
                 close,
             } => {
                 if cap == 0 || emitted_failing < cap {
-                    block.commit_failing(&mut out, running.as_deref(), &lines, &close);
+                    block.commit_failing(&mut out, running, &lines, close);
                     emitted_failing += 1;
                 } else {
                     block.drop_failing();
@@ -567,9 +567,8 @@ pub fn filter_compile(raw: &str) -> String {
             continue;
         }
         if line.starts_with("[WARNING]") {
-            let norm = FILE_COORD
-                .replace_all(&line["[WARNING] ".len().min(line.len())..], "")
-                .to_string();
+            let payload = line.strip_prefix("[WARNING] ").unwrap_or(line);
+            let norm = FILE_COORD.replace_all(payload, "").to_string();
             if seen_warnings.insert(norm) {
                 out.push_str(line);
                 out.push('\n');
@@ -620,7 +619,7 @@ fn filter_package_with_cap(raw: &str, cap: usize) -> String {
                 close,
             } => {
                 if cap == 0 || emitted_failing < cap {
-                    block.commit_failing(&mut out, running.as_deref(), &lines, &close);
+                    block.commit_failing(&mut out, running, &lines, close);
                     emitted_failing += 1;
                 } else {
                     block.drop_failing();
@@ -658,9 +657,8 @@ fn filter_package_with_cap(raw: &str, cap: usize) -> String {
             continue;
         }
         if line.starts_with("[WARNING]") {
-            let norm = FILE_COORD
-                .replace_all(&line["[WARNING] ".len().min(line.len())..], "")
-                .to_string();
+            let payload = line.strip_prefix("[WARNING] ").unwrap_or(line);
+            let norm = FILE_COORD.replace_all(payload, "").to_string();
             if seen_warnings.insert(norm) {
                 out.push_str(line);
                 out.push('\n');
@@ -1220,6 +1218,38 @@ mod tests {
             o.contains("there is no POM"),
             "no-pom error preserved; got:\n{}",
             o
+        );
+    }
+
+    // ── CRLF line-ending compatibility ───────────────────────────────────────
+
+    /// `str::lines()` splits on `\n` but keeps any trailing `\r`, so exact
+    /// equality / `starts_with("…")` checks can silently fail under Windows
+    /// line endings. Convert an LF fixture to CRLF, filter both, normalise
+    /// the CRLF output back to LF, and assert byte-equality.
+    #[test]
+    fn surefire_handles_crlf_line_endings() {
+        let i_lf = include_str!("../../../tests/fixtures/mvn_test_pass_slice_raw.txt");
+        let o_lf = filter_surefire(i_lf);
+        let i_crlf = i_lf.replace('\n', "\r\n");
+        let o_crlf = filter_surefire(&i_crlf);
+        assert_eq!(
+            o_lf,
+            o_crlf.replace("\r\n", "\n"),
+            "CRLF filtered output must match LF (modulo line endings)"
+        );
+    }
+
+    #[test]
+    fn package_handles_crlf_line_endings() {
+        let i_lf = include_str!("../../../tests/fixtures/mvn_install_slice_raw.txt");
+        let o_lf = filter_package(i_lf);
+        let i_crlf = i_lf.replace('\n', "\r\n");
+        let o_crlf = filter_package(&i_crlf);
+        assert_eq!(
+            o_lf,
+            o_crlf.replace("\r\n", "\n"),
+            "CRLF filtered output must match LF (modulo line endings)"
         );
     }
 
