@@ -120,23 +120,40 @@ fn get_rewritten(cmd: &str) -> Option<String> {
     Some(rewritten)
 }
 
-fn handle_vscode(cmd: &str) -> Result<()> {
-    let verdict = permissions::check_command(cmd);
+enum HookDecision {
+    AllowRewrite(String),
+    AskRewrite(String),
+    Defer,
+    Deny,
+}
+
+fn decide_from_verdict(cmd: &str, verdict: PermissionVerdict) -> HookDecision {
     if verdict == PermissionVerdict::Deny {
-        audit_log("deny", cmd, "");
-        return Ok(());
+        return HookDecision::Deny;
     }
+    if crate::discover::lexer::contains_unattestable_construct(cmd) {
+        return HookDecision::Defer;
+    }
+    match get_rewritten(cmd) {
+        Some(r) if verdict == PermissionVerdict::Allow => HookDecision::AllowRewrite(r),
+        Some(r) => HookDecision::AskRewrite(r),
+        None => HookDecision::Defer,
+    }
+}
 
-    let rewritten = match get_rewritten(cmd) {
-        Some(r) => r,
-        None => return Ok(()),
-    };
+fn decide_hook_action(cmd: &str) -> HookDecision {
+    decide_from_verdict(cmd, permissions::check_command(cmd))
+}
 
-    // Allow (explicit rule matched): auto-allow the rewritten command.
-    // Ask/Default (no allow rule matched): rewrite but let the host tool prompt.
-    let decision = match verdict {
-        PermissionVerdict::Allow => "allow",
-        _ => "ask",
+fn handle_vscode(cmd: &str) -> Result<()> {
+    let (decision, rewritten) = match decide_hook_action(cmd) {
+        HookDecision::Deny => {
+            audit_log("deny", cmd, "");
+            return Ok(());
+        }
+        HookDecision::Defer => return Ok(()),
+        HookDecision::AllowRewrite(r) => ("allow", r),
+        HookDecision::AskRewrite(r) => ("ask", r),
     };
 
     audit_log("rewrite", cmd, &rewritten);
@@ -156,6 +173,10 @@ fn handle_vscode(cmd: &str) -> Result<()> {
 fn handle_copilot_cli(cmd: &str) -> Result<()> {
     if permissions::check_command(cmd) == PermissionVerdict::Deny {
         audit_log("deny", cmd, "");
+        return Ok(());
+    }
+
+    if crate::discover::lexer::contains_unattestable_construct(cmd) {
         return Ok(());
     }
 
@@ -202,25 +223,22 @@ pub fn run_gemini() -> Result<()> {
         return Ok(());
     }
 
-    // Check deny rules — Gemini CLI only supports allow/deny (no ask mode).
-    if permissions::check_command(cmd) == PermissionVerdict::Deny {
-        let _ = writeln!(
-            io::stdout(),
-            r#"{{"decision":"deny","reason":"Blocked by RTK permission rule"}}"#
-        );
-        return Ok(());
-    }
-
-    let (excluded, transparent_prefixes) = crate::core::config::Config::load()
-        .map(|c| (c.hooks.exclude_commands, c.hooks.transparent_prefixes))
-        .unwrap_or_default();
-
-    match rewrite_command(cmd, &excluded, &transparent_prefixes) {
-        Some(ref rewritten) => {
-            audit_log("rewrite", cmd, rewritten);
-            print_rewrite(rewritten);
+    match decide_hook_action(cmd) {
+        HookDecision::Deny => {
+            let _ = writeln!(
+                io::stdout(),
+                r#"{{"decision":"deny","reason":"Blocked by RTK permission rule"}}"#
+            );
         }
-        None => print_allow(),
+        HookDecision::AllowRewrite(ref rewritten) => {
+            audit_log("rewrite", cmd, rewritten);
+            print_gemini("allow", Some(rewritten));
+        }
+        HookDecision::AskRewrite(ref rewritten) => {
+            audit_log("ask", cmd, rewritten);
+            print_gemini("ask_user", Some(rewritten));
+        }
+        HookDecision::Defer => print_gemini("ask_user", None),
     }
 
     Ok(())
@@ -230,16 +248,16 @@ fn print_allow() {
     let _ = writeln!(io::stdout(), r#"{{"decision":"allow"}}"#);
 }
 
-fn print_rewrite(cmd: &str) {
-    let output = serde_json::json!({
-        "decision": "allow",
-        "hookSpecificOutput": {
-            "tool_input": {
-                "command": cmd
-            }
-        }
-    });
-    let _ = writeln!(io::stdout(), "{}", output);
+fn gemini_json(decision: &str, rewrite: Option<&str>) -> String {
+    let mut output = serde_json::json!({ "decision": decision });
+    if let Some(cmd) = rewrite {
+        output["hookSpecificOutput"] = serde_json::json!({ "tool_input": { "command": cmd } });
+    }
+    output.to_string()
+}
+
+fn print_gemini(decision: &str, rewrite: Option<&str>) {
+    let _ = writeln!(io::stdout(), "{}", gemini_json(decision, rewrite));
 }
 
 // ── Audit logging ─────────────────────────────────────────────
@@ -307,22 +325,21 @@ fn process_claude_payload(v: &Value) -> PayloadAction {
         None => return PayloadAction::Ignore,
     };
 
-    let verdict = permissions::check_command(cmd);
-    if verdict == PermissionVerdict::Deny {
-        return PayloadAction::Skip {
-            reason: "skip:deny_rule",
-            cmd: cmd.to_string(),
-        };
-    }
-
-    let rewritten = match get_rewritten(cmd) {
-        Some(r) => r,
-        None => {
+    let (rewritten, allow) = match decide_hook_action(cmd) {
+        HookDecision::Deny => {
             return PayloadAction::Skip {
-                reason: "skip:no_match",
+                reason: "skip:deny_rule",
                 cmd: cmd.to_string(),
             }
         }
+        HookDecision::Defer => {
+            return PayloadAction::Skip {
+                reason: "skip:defer",
+                cmd: cmd.to_string(),
+            }
+        }
+        HookDecision::AllowRewrite(r) => (r, true),
+        HookDecision::AskRewrite(r) => (r, false),
     };
 
     let updated_input = {
@@ -339,7 +356,7 @@ fn process_claude_payload(v: &Value) -> PayloadAction {
         "updatedInput": updated_input
     });
 
-    if verdict == PermissionVerdict::Allow {
+    if allow {
         hook_output
             .as_object_mut()
             .unwrap()
@@ -441,40 +458,29 @@ pub fn run_cursor() -> Result<()> {
         }
     };
 
-    let verdict = permissions::check_command(&cmd);
-    if verdict == PermissionVerdict::Deny {
-        audit_log("deny", &cmd, "");
-        let _ = writeln!(io::stdout(), "{{}}");
-        return Ok(());
-    }
-
-    let rewritten = match get_rewritten(&cmd) {
-        Some(r) => r,
-        None => {
-            let _ = writeln!(io::stdout(), "{{}}");
-            return Ok(());
+    let output = match decide_hook_action(&cmd) {
+        HookDecision::AllowRewrite(rewritten) => {
+            audit_log("rewrite", &cmd, &rewritten);
+            cursor_allow(&rewritten)
+        }
+        other => {
+            if matches!(other, HookDecision::Deny) {
+                audit_log("deny", &cmd, "");
+            }
+            "{}".to_string()
         }
     };
-
-    // Cursor preToolUse currently enforces allow/deny only and can ignore
-    // updated_input when permission is "ask". Use "allow" for rewritten
-    // commands unless the command is explicitly denied above.
-    let decision = "allow";
-
-    audit_log("rewrite", &cmd, &rewritten);
-
-    // `continue: true` mirrors the shape of every other Cursor hook
-    // (afterShellExecution, beforeSubmitPrompt, stop, ...). Cursor's
-    // preToolUse panel renders the JSON it received; without this field
-    // the panel collapses to `Output: {}` even though the rewrite ran,
-    // which makes the hook look broken to users.
-    let output = json!({
-        "continue": true,
-        "permission": decision,
-        "updated_input": { "command": rewritten }
-    });
     let _ = writeln!(io::stdout(), "{output}");
     Ok(())
+}
+
+fn cursor_allow(rewritten: &str) -> String {
+    json!({
+        "continue": true,
+        "permission": "allow",
+        "updated_input": { "command": rewritten }
+    })
+    .to_string()
 }
 
 #[cfg(test)]
@@ -505,21 +511,9 @@ fn run_cursor_inner_with_rules(
     };
 
     let verdict = permissions::check_command_with_rules(&cmd, deny_rules, ask_rules, allow_rules);
-    if verdict == PermissionVerdict::Deny {
-        return "{}".to_string();
-    }
-
-    match get_rewritten(&cmd) {
-        Some(rewritten) => {
-            let decision = "allow";
-            let output = json!({
-                "continue": true,
-                "permission": decision,
-                "updated_input": { "command": rewritten }
-            });
-            output.to_string()
-        }
-        None => "{}".to_string(),
+    match decide_from_verdict(&cmd, verdict) {
+        HookDecision::AllowRewrite(rewritten) => cursor_allow(&rewritten),
+        _ => "{}".to_string(),
     }
 }
 
@@ -714,6 +708,26 @@ mod tests {
     }
 
     #[test]
+    fn test_claude_substitution_not_rewritten() {
+        // A substitution payload must never be rewritten into updatedInput;
+        // RTK skips so Claude Code evaluates the original command natively.
+        assert!(run_claude_inner(&claude_input("git status `rm -rf /tmp/x`")).is_none());
+        assert!(run_claude_inner(&claude_input("git status $(rm -rf /tmp/x)")).is_none());
+        assert!(run_claude_inner(&claude_input("git log --pretty=\"$(rm -rf /tmp/x)\"")).is_none());
+    }
+
+    #[test]
+    fn test_claude_file_redirect_not_rewritten() {
+        assert!(run_claude_inner(&claude_input("git log > /tmp/out.txt")).is_none());
+    }
+
+    #[test]
+    fn test_claude_fd_dup_redirect_still_rewritten() {
+        // `2>&1` is attestable — the rewrite proceeds as normal.
+        assert!(run_claude_inner(&claude_input("git status 2>&1")).is_some());
+    }
+
+    #[test]
     fn test_claude_heredoc_passthrough() {
         assert!(run_claude_inner(&claude_input("cat <<EOF\nhello\nEOF")).is_none());
     }
@@ -790,9 +804,13 @@ mod tests {
         .to_string()
     }
 
+    fn run_cursor_allowed(input: &str) -> String {
+        run_cursor_inner_with_rules(input, &[], &[], &["*".to_string()])
+    }
+
     #[test]
     fn test_cursor_rewrite_flat_format() {
-        let result = run_cursor_inner(&cursor_input("git status"));
+        let result = run_cursor_allowed(&cursor_input("git status"));
         let v: Value = serde_json::from_str(&result).unwrap();
         // Cursor preToolUse expects allow/deny for rewrite application.
         assert_eq!(v["permission"], "allow");
@@ -801,6 +819,34 @@ mod tests {
         // `continue: true` keeps the Cursor preToolUse panel from collapsing
         // to `Output: {}`; without it the rewrite is invisible to users.
         assert_eq!(v["continue"], true);
+    }
+
+    #[test]
+    fn test_cursor_no_allow_rule_defers() {
+        assert_eq!(run_cursor_inner(&cursor_input("git status")), "{}");
+    }
+
+    #[test]
+    fn test_cursor_substitution_defers_even_when_allowed() {
+        assert_eq!(
+            run_cursor_allowed(&cursor_input("git status `rm -rf /tmp/x`")),
+            "{}"
+        );
+        assert_eq!(
+            run_cursor_allowed(&cursor_input("git status $(rm -rf /tmp/x)")),
+            "{}"
+        );
+    }
+
+    #[test]
+    fn test_cursor_unallowed_segment_defers() {
+        let out = run_cursor_inner_with_rules(
+            &cursor_input("git status && rm -rf /tmp/x"),
+            &[],
+            &[],
+            &["git *".to_string()],
+        );
+        assert_eq!(out, "{}");
     }
 
     #[test]
@@ -829,7 +875,7 @@ mod tests {
 
     #[test]
     fn test_cursor_no_hook_specific_output() {
-        let result = run_cursor_inner(&cursor_input("cargo test"));
+        let result = run_cursor_allowed(&cursor_input("cargo test"));
         let v: Value = serde_json::from_str(&result).unwrap();
         assert!(v.get("hookSpecificOutput").is_none());
         assert_eq!(v["permission"], "allow");
@@ -839,7 +885,7 @@ mod tests {
     #[test]
     fn test_cursor_compound_rewrite_includes_continue() {
         let cmd = "cd \"/tmp/proj\" && git status";
-        let result = run_cursor_inner(&cursor_input(cmd));
+        let result = run_cursor_allowed(&cursor_input(cmd));
         let v: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(v["continue"], true);
         assert_eq!(v["permission"], "allow");
@@ -856,7 +902,7 @@ mod tests {
         // the hook returned `{}` and the rewrite became a silent no-op.
         let payload = cursor_input("git status");
         let with_single_bom = format!("\u{feff}{}", payload);
-        let result = run_cursor_inner(&with_single_bom);
+        let result = run_cursor_allowed(&with_single_bom);
         let v: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(v["continue"], true);
         assert_eq!(v["permission"], "allow");
@@ -871,7 +917,7 @@ mod tests {
         // the real-world payload shape the loop needs to survive.
         let payload = cursor_input("git status");
         let with_double_bom = format!("\u{feff}\u{feff}{}", payload);
-        let result = run_cursor_inner(&with_double_bom);
+        let result = run_cursor_allowed(&with_double_bom);
         let v: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(v["continue"], true);
         assert_eq!(v["permission"], "allow");
@@ -987,5 +1033,138 @@ mod tests {
             get_rewritten("cargo test").is_some(),
             "cargo test should be rewritable when not denied"
         );
+    }
+
+    // --- Shared decision flow (all hosts route through this) ---
+
+    fn decide_with_rules(
+        cmd: &str,
+        deny: &[String],
+        ask: &[String],
+        allow: &[String],
+    ) -> HookDecision {
+        let verdict = permissions::check_command_with_rules(cmd, deny, ask, allow);
+        decide_from_verdict(cmd, verdict)
+    }
+
+    fn all_allowed() -> Vec<String> {
+        vec!["*".to_string()]
+    }
+
+    #[test]
+    fn test_decide_allow_for_attestable_allowed_command() {
+        assert!(matches!(
+            decide_with_rules("git status", &[], &[], &all_allowed()),
+            HookDecision::AllowRewrite(_)
+        ));
+    }
+
+    #[test]
+    fn test_decide_ask_for_default_verdict() {
+        assert!(matches!(
+            decide_with_rules("git status", &[], &[], &[]),
+            HookDecision::AskRewrite(_)
+        ));
+    }
+
+    #[test]
+    fn test_decide_deny() {
+        assert!(matches!(
+            decide_with_rules(
+                "rm -rf /tmp/x",
+                &["rm -rf".to_string()],
+                &[],
+                &all_allowed()
+            ),
+            HookDecision::Deny
+        ));
+    }
+
+    #[test]
+    fn test_decide_defer_for_substitution_even_when_allowed() {
+        for cmd in [
+            "git status `rm -rf /tmp/x`",
+            "git status $(rm -rf /tmp/x)",
+            "git log --pretty=\"$(rm -rf /tmp/x)\"",
+        ] {
+            assert!(
+                matches!(
+                    decide_with_rules(cmd, &[], &[], &all_allowed()),
+                    HookDecision::Defer
+                ),
+                "expected Defer for {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decide_defer_for_file_redirect() {
+        assert!(matches!(
+            decide_with_rules("git log > /tmp/out.txt", &[], &[], &all_allowed()),
+            HookDecision::Defer
+        ));
+    }
+
+    #[test]
+    fn test_decide_allow_for_fd_dup_redirect() {
+        assert!(matches!(
+            decide_with_rules("git status 2>&1", &[], &[], &all_allowed()),
+            HookDecision::AllowRewrite(_)
+        ));
+    }
+
+    // --- Gemini rendering ---
+
+    fn gemini_render(cmd: &str, deny: &[String], ask: &[String], allow: &[String]) -> String {
+        match decide_with_rules(cmd, deny, ask, allow) {
+            HookDecision::Deny => {
+                r#"{"decision":"deny","reason":"Blocked by RTK permission rule"}"#.to_string()
+            }
+            HookDecision::AllowRewrite(r) => gemini_json("allow", Some(&r)),
+            HookDecision::AskRewrite(r) => gemini_json("ask_user", Some(&r)),
+            HookDecision::Defer => gemini_json("ask_user", None),
+        }
+    }
+
+    #[test]
+    fn test_gemini_allow_emits_rewrite() {
+        let v: Value =
+            serde_json::from_str(&gemini_render("git status", &[], &[], &all_allowed())).unwrap();
+        assert_eq!(v["decision"], "allow");
+        assert_eq!(
+            v["hookSpecificOutput"]["tool_input"]["command"],
+            "rtk git status"
+        );
+    }
+
+    #[test]
+    fn test_gemini_default_asks_user() {
+        let v: Value = serde_json::from_str(&gemini_render("git status", &[], &[], &[])).unwrap();
+        assert_eq!(v["decision"], "ask_user");
+    }
+
+    #[test]
+    fn test_gemini_substitution_asks_user_without_rewrite() {
+        let v: Value = serde_json::from_str(&gemini_render(
+            "git status `rm -rf /tmp/x`",
+            &[],
+            &[],
+            &all_allowed(),
+        ))
+        .unwrap();
+        assert_eq!(v["decision"], "ask_user");
+        assert!(v.get("hookSpecificOutput").is_none());
+    }
+
+    #[test]
+    fn test_gemini_deny_decision() {
+        let v: Value = serde_json::from_str(&gemini_render(
+            "rm -rf /tmp/x",
+            &["rm -rf".to_string()],
+            &[],
+            &[],
+        ))
+        .unwrap();
+        assert_eq!(v["decision"], "deny");
     }
 }

