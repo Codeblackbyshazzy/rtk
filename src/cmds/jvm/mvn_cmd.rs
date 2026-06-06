@@ -121,6 +121,26 @@ fn is_framework_frame(trimmed: &str) -> bool {
         .any(|p| trimmed.starts_with(p))
 }
 
+/// Boilerplate `[ERROR]` lines Maven emits after `Failed to execute goal` —
+/// pure noise pointing at log files and help URLs, no signal for the user/LLM.
+/// Deliberately excludes `[ERROR] After correcting the problems` and
+/// `[ERROR]   mvn <args> -rf :…` (the resume hint is actionable signal for a
+/// multi-module build) and `[ERROR] Failed to execute goal` (signal).
+const BOILER_PREFIXES: &[&str] = &[
+    "[ERROR] See ",
+    "[ERROR] -> [Help",
+    "[ERROR] To see the full stack trace",
+    "[ERROR] Re-run Maven",
+    "[ERROR] For more information",
+    "[ERROR] [Help",
+];
+
+/// Post-failure help boilerplate, plus the bare `[ERROR]` divider lines Maven
+/// emits between boilerplate blocks (same drop rules as `filter_quiet`).
+fn is_boilerplate(line: &str) -> bool {
+    BOILER_PREFIXES.iter().any(|p| line.starts_with(p)) || line.trim_end() == "[ERROR]"
+}
+
 /// `[ERROR] FQN.method -- Time elapsed: 0.030 s <<< FAILURE!` (or `<<< ERROR!`).
 /// Distinguished from CLOSE by call position: only consulted when
 /// `in_block == false` (CLOSE only occurs while a block is open). A
@@ -166,6 +186,11 @@ fn reactor_summary_keep(line: &str, in_reactor_summary: &mut bool) -> bool {
 }
 
 fn keep_outside_block(line: &str) -> bool {
+    // Help boilerplate must be rejected before the `[ERROR]` catch-all below
+    // (non-quiet parity with `filter_quiet`'s boilerplate stripping).
+    if is_boilerplate(line) {
+        return false;
+    }
     RESULTS.is_match(line)
         || AGG.is_match(line)
         || BUILD_FOOT.is_match(line)
@@ -566,6 +591,10 @@ fn filter_surefire_with_cap(raw: &str, cap: usize) -> String {
                 && !line.starts_with("[ERROR] Errors:");
             continue;
         }
+        // Dropped line (e.g. help boilerplate): reset so a stale flag can't
+        // keep an indented line that follows a dropped `[ERROR]` line.
+        // Parity with filter_package's fall-through reset.
+        keep_continuation = false;
     }
 
     block.finish(&mut out);
@@ -612,6 +641,12 @@ pub fn filter_compile(raw: &str) -> String {
         {
             out.push_str(line);
             out.push('\n');
+            keep_continuation = false;
+            continue;
+        }
+        // Help boilerplate: drop before the `[ERROR]` catch-all (parity with
+        // keep_outside_block / filter_quiet).
+        if is_boilerplate(line) {
             keep_continuation = false;
             continue;
         }
@@ -742,17 +777,6 @@ fn filter_package_with_cap(raw: &str, cap: usize) -> String {
 
 // ── Quiet-mode filter ───────────────────────────────────────────────────────
 
-/// Boilerplate `[ERROR]` lines Maven emits after `Failed to execute goal` —
-/// pure noise pointing at log files and help URLs, no signal for the user/LLM.
-const QUIET_BOILER_PREFIXES: &[&str] = &[
-    "[ERROR] See ",
-    "[ERROR] -> [Help",
-    "[ERROR] To see the full stack trace",
-    "[ERROR] Re-run Maven",
-    "[ERROR] For more information",
-    "[ERROR] [Help",
-];
-
 /// Filter for `mvn -q` invocations.
 ///
 /// Under `-q`, Maven 3.x suppresses all `[INFO]` lines, so the standard
@@ -824,13 +848,9 @@ pub fn filter_quiet(raw: &str) -> String {
             continue;
         }
 
-        // Drop post-failure help boilerplate.
-        if QUIET_BOILER_PREFIXES.iter().any(|p| line.starts_with(p)) {
-            continue;
-        }
-
-        // Drop empty `[ERROR]` / `[ERROR] ` divider lines Maven emits between blocks.
-        if line.trim_end() == "[ERROR]" {
+        // Drop post-failure help boilerplate and bare `[ERROR]` dividers
+        // (shared with the non-quiet filters — see BOILER_PREFIXES).
+        if is_boilerplate(line) {
             continue;
         }
 
@@ -1382,18 +1402,54 @@ mod tests {
 
     /// Savings on the multifail slice. Threshold is low by design: the slice
     /// is nearly all kept failure signal (two failing classes, three per-test
-    /// detail blocks), so the droppable share is small — measured 19.9% at
-    /// commit time (precedent: reactor-fail pins ≥30% with a "short fixture"
-    /// note).
+    /// detail blocks), so the droppable share is small — measured 42.3% after
+    /// non-quiet boilerplate stripping (19.9% before it; precedent:
+    /// reactor-fail pins ≥30% with a "short fixture" note).
     #[test]
     fn savings_mvn_test_multifail_slice() {
         let i = include_str!("../../../tests/fixtures/mvn_test_multifail_slice_raw.txt");
         let o = filter_surefire(i);
         let savings = 100.0 - (count_tokens(&o) as f64 / count_tokens(i) as f64 * 100.0);
         assert!(
-            savings >= 15.0,
-            "multifail slice ≥15% savings (dense failure-signal fixture), got {:.1}%",
+            savings >= 30.0,
+            "multifail slice ≥30% savings (dense failure-signal fixture), got {:.1}%",
             savings
+        );
+    }
+
+    /// Non-quiet runs must strip the post-failure help boilerplate
+    /// (`-> [Help 1]`, `Re-run Maven`, `See …`, bare `[ERROR]` dividers) the
+    /// same way `filter_quiet` does, while keeping the `Failed to execute
+    /// goal` terminator (signal).
+    #[test]
+    fn surefire_drops_help_boilerplate_in_nonquiet_mode() {
+        let i = include_str!("../../../tests/fixtures/mvn_test_multifail_slice_raw.txt");
+        let o = filter_surefire(i);
+        assert!(
+            o.contains("[ERROR] Failed to execute goal"),
+            "goal terminator kept; got:\n{}",
+            o
+        );
+        assert!(!o.contains("[Help 1]"), "help link stripped; got:\n{}", o);
+        assert!(
+            !o.contains("Re-run Maven"),
+            "re-run hint stripped; got:\n{}",
+            o
+        );
+        assert!(
+            !o.contains("To see the full stack trace"),
+            "stack-trace hint stripped; got:\n{}",
+            o
+        );
+        assert!(
+            !o.contains("See dump files"),
+            "dump-file pointer stripped; got:\n{}",
+            o
+        );
+        assert!(
+            !o.lines().any(|l| l.trim_end() == "[ERROR]"),
+            "bare [ERROR] dividers stripped; got:\n{}",
+            o
         );
     }
 
@@ -1766,6 +1822,17 @@ mod tests {
             "goal terminator preserved; got:\n{}",
             o
         );
+        assert!(
+            o.contains("mvn <args> -rf :child-b"),
+            "resume hint preserved (actionable signal); got:\n{}",
+            o
+        );
+        assert!(!o.contains("[Help 1]"), "help boilerplate stripped; got:\n{}", o);
+        assert!(
+            !o.contains("Re-run Maven"),
+            "re-run hint stripped; got:\n{}",
+            o
+        );
         let savings = 100.0 - (count_tokens(&o) as f64 / count_tokens(i) as f64 * 100.0);
         assert!(
             savings >= 30.0,
@@ -1798,6 +1865,11 @@ mod tests {
             "indented continuation preserved"
         );
         assert!(o.contains("BUILD FAILURE"), "footer preserved");
+        assert!(
+            !o.contains("[Help 1]"),
+            "help boilerplate stripped in compile path; got:\n{}",
+            o
+        );
     }
 
     #[test]
@@ -2029,5 +2101,6 @@ mod tests {
         );
     }
 }
+
 
 
