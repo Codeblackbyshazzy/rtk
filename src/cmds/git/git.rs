@@ -1030,9 +1030,6 @@ fn run_commit(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
             timer.track(&original_cmd, "rtk git commit", &raw_output, &compact);
             Ok(0)
         }
-        // A failed commit must never be reported as "ok". This covers "nothing
-        // to commit" (git exits 1) and pre-commit hook aborts: surface git's
-        // own message and propagate its exit code, like native git (#2494).
         CommitOutcome::Failed(code) => {
             eprintln!("FAILED: git commit");
             if !stderr.trim().is_empty() {
@@ -1047,10 +1044,8 @@ fn run_commit(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
     }
 }
 
-/// Outcome of a `git commit` invocation. A non-success status must never be
-/// reported as success — the previous code printed "ok (nothing to commit)" and
-/// returned 0 for a commit git had rejected (#2494). This enum makes the
-/// success/failure split explicit so the exit code is always propagated.
+/// Outcome of a `git commit`: a non-success status propagates the exit code
+/// rather than being reported as "ok" (#2494).
 enum CommitOutcome {
     /// Commit succeeded; carries the compact one-line summary for stdout.
     Ok(String),
@@ -2466,8 +2461,6 @@ no changes added to commit (use "git add" and/or "git commit -a")
 
     #[test]
     fn test_classify_commit_nothing_to_commit_is_failure() {
-        // #2494: `git commit` with nothing staged exits 1. It must NOT be
-        // reported as ok/0 — that masked a no-op commit as success.
         match classify_commit_outcome(
             false,
             "On branch main\nnothing to commit, working tree clean",
@@ -2480,7 +2473,6 @@ no changes added to commit (use "git add" and/or "git commit -a")
 
     #[test]
     fn test_classify_commit_hook_abort_propagates_exit_code() {
-        // A pre-commit hook abort exits non-zero; propagate it verbatim.
         match classify_commit_outcome(false, "pre-commit hook failed", 2) {
             CommitOutcome::Failed(code) => assert_eq!(code, 2),
             CommitOutcome::Ok(_) => panic!("hook abort must be a failure"),
